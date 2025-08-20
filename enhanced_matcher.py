@@ -62,12 +62,21 @@ class EnhancedProductMatcher:
             r'\bnew\b', r'\bimproved\b', r'\bformula\b'
         ]
         
+        # Phrases that indicate promotional/discounted prices (to be avoided)
+        self.promotional_phrases = [
+            r'\bclubcard\b', r'\bprice\b', r'\bwas\b', r'\bnow\b',
+            r'\boffer\b', r'\bdeal\b', r'\bspecial\b', r'\bsave\b',
+            r'\breduced\b', r'\bclearance\b', r'\bmultibuy\b',
+            r'\b\d+\s*for\s*£?\d+\.?\d*\b',  # Multi-buy offers
+            r'\b\d+\s*[x×]\b',  # Quantity indicators (2x, 3x)
+        ]
+        
         # Weight/volume patterns
         self.weight_patterns = [
-            (r'(\d+)\s*[gG]', 'g'),  # grams
-            (r'(\d+)\s*[kK][gG]', 'kg'),  # kilograms
-            (r'(\d+)\s*[mM][lL]', 'ml'),  # milliliters
-            (r'(\d+)\s*[lL]', 'l'),  # liters
+            (r'(\d+(?:\.\d+)?)\s*[gG]', 'g'),  # grams
+            (r'(\d+(?:\.\d+)?)\s*[kK][gG]', 'kg'),  # kilograms
+            (r'(\d+(?:\.\d+)?)\s*[mM][lL]', 'ml'),  # milliliters
+            (r'(\d+(?:\.\d+)?)\s*[lL]', 'l'),  # liters
             (r'(\d+)\s*[pP][cC]', 'pc'),  # pieces
             (r'(\d+)\s*pack', 'pack'),  # pack
             (r'(\d+)\s*[xX]', 'x'),  # multiplier
@@ -79,7 +88,7 @@ class EnhancedProductMatcher:
             'bread': (0.80, 3.00),
             'eggs': (1.00, 4.00),
             'cheese': (1.50, 8.00),
-            'baked beans': (0.30, 2.00),
+            'baked beans': (0.30, 3.00),
             'soup': (0.50, 3.00),
             'pasta': (0.50, 3.00),
             'rice': (0.50, 4.00),
@@ -111,13 +120,43 @@ class EnhancedProductMatcher:
         
         return text
     
+    def is_promotional_price(self, text: str) -> bool:
+        """Check if the product name indicates a promotional/discounted price"""
+        if not text:
+            return False
+        
+        text_lower = text.lower()
+        
+        for phrase in self.promotional_phrases:
+            if re.search(phrase, text_lower):
+                return True
+        
+        return False
+    
     def extract_weight_volume(self, text: str) -> Tuple[Optional[float], Optional[str]]:
-        """Extract weight/volume information for better matching"""
+        """Extract weight/volume information for better matching, handling multipacks"""
         if not text:
             return None, None
         
         text_lower = text.lower()
         
+        # First, check for multipack formats like "6 x 25g", "4 x 400ml", etc.
+        multipack_patterns = [
+            (r'(\d+)\s*[x×]\s*(\d+(?:\.\d+)?)\s*([gG])', 'g'),  # 6 x 25g
+            (r'(\d+)\s*[x×]\s*(\d+(?:\.\d+)?)\s*([kK][gG])', 'kg'),  # 2 x 1kg
+            (r'(\d+)\s*[x×]\s*(\d+(?:\.\d+)?)\s*([mM][lL])', 'ml'),  # 4 x 250ml
+            (r'(\d+)\s*[x×]\s*(\d+(?:\.\d+)?)\s*([lL])', 'l'),  # 2 x 1l
+        ]
+        
+        for pattern, unit in multipack_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                quantity = float(match.group(1))
+                individual_weight = float(match.group(2))
+                total_weight = quantity * individual_weight
+                return total_weight, unit
+        
+        # If no multipack found, check for regular weight patterns
         for pattern, unit in self.weight_patterns:
             match = re.search(pattern, text_lower)
             if match:
@@ -208,12 +247,78 @@ class EnhancedProductMatcher:
         
         return 0.0
     
+    def check_same_brand_weight_match(self, product1: str, product2: str) -> Tuple[bool, float]:
+        """Check if two products have the same brand and weight but different flavors"""
+        # Extract brand and product info
+        brand1, product_info1 = self.extract_brand_and_product(product1)
+        brand2, product_info2 = self.extract_brand_and_product(product2)
+        
+        # Extract weights
+        weight1, unit1 = self.extract_weight_volume(product1)
+        weight2, unit2 = self.extract_weight_volume(product2)
+        
+        # Check if brands match
+        if not brand1 or not brand2:
+            return False, 0.0
+        
+        brand_similarity = self.check_brand_similarity(product1, product2)
+        if brand_similarity < 0.8:  # Require high brand similarity
+            return False, 0.0
+        
+        # Check if weights match exactly
+        if weight1 is None or weight2 is None:
+            return False, 0.0
+        
+        # Convert to same unit if possible
+        weight1_kg = self._convert_to_kg(weight1, unit1)
+        weight2_kg = self._convert_to_kg(weight2, unit2)
+        
+        if weight1_kg is None or weight2_kg is None:
+            return False, 0.0
+        
+        # Check if weights are exactly the same
+        if weight1_kg != weight2_kg:
+            return False, 0.0
+        
+        # Check if flavors are different (this indicates same product line, different variant)
+        # Look for flavor indicators in the product names
+        flavor_indicators = [
+            'tomato', 'chicken', 'beef', 'vegetable', 'mushroom', 'cream', 'cheese',
+            'original', 'classic', 'traditional', 'organic', 'reduced', 'light',
+            'sweet', 'sour', 'spicy', 'mild', 'hot', 'garlic', 'herb', 'basil',
+            'oregano', 'thyme', 'rosemary', 'lemon', 'lime', 'orange', 'berry',
+            'strawberry', 'chocolate', 'vanilla', 'caramel', 'coffee', 'mint'
+        ]
+        
+        product1_lower = product1.lower()
+        product2_lower = product2.lower()
+        
+        flavor1 = None
+        flavor2 = None
+        
+        for flavor in flavor_indicators:
+            if flavor in product1_lower:
+                flavor1 = flavor
+            if flavor in product2_lower:
+                flavor2 = flavor
+        
+        # If we found different flavors, this is a good match
+        if flavor1 and flavor2 and flavor1 != flavor2:
+            return True, 0.85  # High confidence for same brand/weight, different flavor
+        
+        # If no specific flavors found, check if the product names are different
+        # but have the same brand and weight
+        if product_info1 != product_info2:
+            return True, 0.75  # Medium confidence for same brand/weight, different variant
+        
+        return False, 0.0
+    
     def _convert_to_kg(self, value: float, unit: str) -> Optional[float]:
-        """Convert weight/volume to kg for comparison"""
+        """Convert weight/volume to kg/l for comparison"""
         conversions = {
             'g': value / 1000,
             'kg': value,
-            'ml': value / 1000,  # Approximate for liquids
+            'ml': value / 1000,  # Convert ml to liters for liquid comparison
             'l': value,
             'pc': None,  # Pieces can't be converted
             'pack': None,  # Packs can't be converted
@@ -224,14 +329,17 @@ class EnhancedProductMatcher:
     
     def enhanced_product_match(self, product_name: str, scraped_items: List[Dict], 
                              threshold: float = 0.7) -> Optional[ProductMatch]:
-        """Match products using multiple criteria"""
+        """Match products using multiple criteria with preference for base retail prices"""
         if not scraped_items:
             return None
         
         product_name_clean = self.clean_product_text(product_name)
         best_match = None
         highest_score = 0
+        promotional_penalty = 0.3  # Penalty for promotional prices
         
+        # First pass: look for exact matches, prioritizing non-promotional
+        exact_matches = []
         for item in scraped_items:
             item_name = item.get('name', '')
             if not item_name:
@@ -239,21 +347,58 @@ class EnhancedProductMatcher:
             
             item_name_clean = self.clean_product_text(item_name)
             
-            # 1. Exact match
             if product_name_clean == item_name_clean:
-                return self._create_product_match(item, 1.0, 'exact')
+                is_promotional = self.is_promotional_price(item_name)
+                exact_matches.append((item, is_promotional))
+        
+        # If we have exact matches, return the best one (non-promotional preferred)
+        if exact_matches:
+            # Sort by promotional status (non-promotional first)
+            exact_matches.sort(key=lambda x: x[1])  # False (non-promotional) comes before True
+            return self._create_product_match(exact_matches[0][0], 1.0, 'exact')
+        
+        # Second pass: look for same brand and weight matches (different flavors)
+        same_brand_weight_matches = []
+        for item in scraped_items:
+            item_name = item.get('name', '')
+            if not item_name:
+                continue
             
-            # 2. Fuzzy matching
+            is_same_brand_weight, confidence = self.check_same_brand_weight_match(product_name, item_name)
+            if is_same_brand_weight:
+                is_promotional = self.is_promotional_price(item_name)
+                same_brand_weight_matches.append((item, confidence, is_promotional))
+        
+        # If we have same brand/weight matches, return the best one (non-promotional preferred)
+        if same_brand_weight_matches:
+            # Sort by promotional status first, then by confidence
+            same_brand_weight_matches.sort(key=lambda x: (x[2], -x[1]))  # Non-promotional first, then highest confidence
+            best_match = same_brand_weight_matches[0]
+            return self._create_product_match(best_match[0], best_match[1], 'same_brand_weight')
+        
+        # Third pass: fuzzy matching with promotional penalty
+        for item in scraped_items:
+            item_name = item.get('name', '')
+            if not item_name:
+                continue
+            
+            item_name_clean = self.clean_product_text(item_name)
+            
+            # 1. Fuzzy matching
             similarity = fuzz.token_set_ratio(product_name_clean, item_name_clean) / 100.0
             
-            # 3. Brand matching
+            # 2. Brand matching
             brand_match = self.check_brand_similarity(product_name, item_name)
             
-            # 4. Weight/volume matching
+            # 3. Weight/volume matching
             weight_match = self.check_weight_similarity(product_name, item_name)
             
-            # Combined score with weights
-            total_score = (similarity * 0.6 + brand_match * 0.2 + weight_match * 0.2)
+            # 4. Apply promotional penalty
+            is_promotional = self.is_promotional_price(item_name)
+            promotional_adjustment = -promotional_penalty if is_promotional else 0
+            
+            # Combined score with weights and promotional penalty
+            total_score = (similarity * 0.6 + brand_match * 0.2 + weight_match * 0.2) + promotional_adjustment
             
             if total_score > highest_score and total_score > threshold:
                 highest_score = total_score
@@ -288,6 +433,12 @@ class EnhancedProductMatcher:
     
     def _extract_price(self, item: Dict) -> Optional[float]:
         """Extract price from item data"""
+        # Check if price is already a number (from trolley scraper)
+        price_value = item.get('price')
+        if isinstance(price_value, (int, float)) and price_value > 0:
+            return float(price_value)
+        
+        # If not a number, try to extract from text
         price_text = item.get('price', '') or item.get('price_text', '')
         if not price_text:
             return None
@@ -359,8 +510,8 @@ class EnhancedProductMatcher:
                     f"Unit price £{unit_price:.2f} doesn't match calculated value £{calculated_unit:.2f}"
                 )
         
-        # Weight sanity check
-        if weight and weight > 10:  # More than 10kg/l is suspicious for most products
+        # Weight sanity check - adjusted for common product weights
+        if weight and weight > 5000:  # More than 5kg is suspicious for most products
             validation_issues.append(f"Unusually large weight/volume: {weight}")
         
         return validation_issues
